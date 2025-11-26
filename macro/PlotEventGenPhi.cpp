@@ -2,25 +2,79 @@
 #include <THnSparse.h>
 #include <TROOT.h>
 #include <TString.h>
+#include <TFile.h> // Needed for reading ROOT files
+#include <TTree.h> // Needed for reading TTree
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <fstream>
 
 #include <ROOT/RDataFrame.hxx>
 
+// Include your custom files (assuming they are still needed)
 #include "../src/DISANAMath.h"
 #include "../src/DISANAcomparer.h"
 #include "../src/DrawStyle.h"
 
-// --- local helpers (needed in this TU) ---
-struct Part {
-  int pdg = 0;
-  double px = 0, py = 0, pz = 0, E = 0, m = 0;
+// --- Global KeepAlive structure for ROOT file ownership ---
+// The TFile needs to be kept open for the RDataFrame to read the TTree data.
+struct _DFKeepAlive {
+  std::string inFilePath;
+  std::shared_ptr<TFile> inFile; // keep the file open
 };
+static _DFKeepAlive g_hold;
+
+
+// --- local helpers (needed in this TU) ---
+// Note: struct Part and get_ptp_for_pdg removed as we read vectors now.
+
 static inline double rad2deg(double r) {
   return r * 180.0 / 3.14159265358979323846;
 }
 static inline double Deg2Rad(double d) { return d * M_PI / 180.0; }
 
+/**
+ * Helper to define p, theta, phi (in degrees) for a specific particle.
+ * This is the new core logic to extract single particle kinematics from
+ * the array columns (pid, px, py, pz) read from the ROOT file.
+ */
+static void get_ptp_deg_from_arrays(const std::vector<int>    &pid,
+                                    const std::vector<double> &px,
+                                    const std::vector<double> &py,
+                                    const std::vector<double> &pz,
+                                    int targetPdg,
+                                    double &p, double &th_deg, double &ph_deg) {
+  p      = -999.0;
+  th_deg = -999.0;
+  ph_deg = -999.0;
+  for (std::size_t i = 0; i < pid.size(); ++i) {
+    if (pid[i] != targetPdg) continue;
+
+    double px_i = px[i], py_i = py[i], pz_i = pz[i];
+    double pp   = std::sqrt(px_i*px_i + py_i*py_i + pz_i*pz_i);
+    double c    = (pp > 0.0) ? pz_i / pp : 1.0;
+    if (c >  1.0) c =  1.0;
+    if (c < -1.0) c = -1.0;
+
+    double th_rad = std::acos(c);
+    double ph_rad = std::atan2(py_i, px_i);
+
+    p = pp;
+    th_deg = rad2deg(th_rad);
+    
+    // Convert phi to -180 to 180 range
+    double phd = rad2deg(ph_rad);
+    if (phd > 180)  phd -= 360;
+    if (phd < -180) phd += 360;
+    ph_deg = phd;
+
+    // Found the particle, stop searching
+    return;
+  }
+}
+
 // Build the final columns requested, starting from p/th/phi (in degrees) that
-// your init() wrote.
+// your init() wrote. (This function is largely unchanged, just the source of p/th/phi changes)
 ROOT::RDF::RNode AddFinalEPKKColumns(ROOT::RDF::RNode df, double EbeamGeV) {
   // physical masses (GeV)
   constexpr double m_e = 0.000510999;
@@ -28,6 +82,8 @@ ROOT::RDF::RNode AddFinalEPKKColumns(ROOT::RDF::RNode df, double EbeamGeV) {
   constexpr double m_k = 0.493677;
 
   // === 1) components from (p,theta,phi) in degrees ===
+  // Note: All columns are defined using the 'new' p_e, th_e, etc. columns
+  // which are defined in the updated init() function.
   auto d = df
                // electron components
                .Define("ele_px",
@@ -120,6 +176,7 @@ ROOT::RDF::RNode AddFinalEPKKColumns(ROOT::RDF::RNode df, double EbeamGeV) {
                          return p * std::cos(th);
                        },
                        {"p_km", "th_km"})
+               // The rest of the definitions remain the same, calculating P, Theta, Phi from Px, Py, Pz
                .Define("recel_p",
                        [](double px, double py, double pz) {
                          return std::sqrt(px * px + py * py + pz * pz);
@@ -206,16 +263,13 @@ ROOT::RDF::RNode AddFinalEPKKColumns(ROOT::RDF::RNode df, double EbeamGeV) {
 
   return d;
 }
-// Holders so the returned RNode stays valid after the function returns
-struct _DFKeepAlive {
-  std::string outFilePath;
-  std::shared_ptr<TFile> outFile;   // keep the file open
-};
-static _DFKeepAlive g_hold;
+
 // -----------------------------------------------------------------------------
 // Forward declare your final selections (implemented below)
 ROOT::RDF::RNode ApplyFinalDVEPSelections(ROOT::RDF::RNode df);
-// convenience 3-vector helpers
+
+// convenience 3-vector helpers (These can be simplified or removed, 
+// as the primary kinematics columns are now created in init() and AddFinalEPKKColumns())
 static double MomentumFunc(float px, float py, float pz) {
   return std::sqrt(px * px + py * py + pz * pz);
 }
@@ -262,23 +316,36 @@ std::vector<std::pair<std::string, std::string>> detCuts = {
     {"pro_det_region == 1", "FD"},
 };
 
-ROOT::RDF::RNode init(const std::string &lund_path);
+// Function signature changed to take root_path instead of lund_path
+ROOT::RDF::RNode init(const std::string &root_path);
 // -----------------------------------------------------------------------------
 // Main plotter with toggles
 void PlotEventGenPhi() // subset toggle inside missing-mass
 {
   //ROOT::EnableImplicitMT();
-  float beam_energy_fall2018 = 6.000f;
-
+  float beam_energy_fall2018 = 10.600f;
+  ROOT::EnableImplicitMT(32);
   // -----------------------------
   // Input locations
   // Exclusive reconstruction K+K-
-  std::string input_path_LundFiles =
-      "/w/hallb-scshelf2102/clas12/singh/Softwares/Generators/dvcsgen/"
-      "PhiEventGen/Phi_Hatta_model/outputs/";
-  std::string filename_Lund_inputs =
-      Form("%s/epKK.lund", input_path_LundFiles.c_str());
-  auto df_clas6_all = init(filename_Lund_inputs);
+  // NOTE: You must provide the path to the *ROOT* file generated by
+  // ConvertOneLundToRootBare/ConvertLundDirToRootBare
+  std::string input_path_RootFiles =
+      "/w/hallb-scshelf2102/clas12/singh/Softwares/Generators/PhiEventGen/analysis/outputs/test_1/input_rootfiles/";
+  
+  // *** EXAMPLE: REPLACE THIS WITH YOUR ACTUAL GENERATED ROOT FILE NAME ***
+  std::string filename_Root_inputs =
+      Form("%s/merged_lund_data.root", input_path_RootFiles.c_str());
+      
+  auto df_clas6_all = init(filename_Root_inputs);
+  
+  // Ensure we check if the DataFrame is valid (i.e., if the ROOT file was opened)
+  if (df_clas6_all.GetNRuns() == 0) {
+      std::cerr << "ERROR: Failed to initialize RDataFrame from ROOT file. Exiting." << std::endl;
+      gApplication->Terminate(1);
+      return;
+  }
+  
   auto df_clas6 = AddFinalEPKKColumns(df_clas6_all, /*Ebeam=*/10.6);
 
   // -----------------------------
@@ -293,30 +360,29 @@ void PlotEventGenPhi() // subset toggle inside missing-mass
 
   // Binning (unchanged)
   BinManager xBins;
-  xBins.SetQ2Bins({1.4,  3.8});
+  xBins.SetQ2Bins({0.4,  10.8});
   xBins.SetXBBins({0, 0.99});
-  xBins.SetWBins({2.0, 3.0});
+  xBins.SetWBins({1.8, 10.6});
   xBins.SetTBins({0.2, .3, 0.4, 0.5, .7, .8, 1.0, 1.4, 1.8, 2.5,3.0, 3.5, 4.0, 5.0, 8.0 });
   comparer.SetXBinsRanges(xBins);
   comparer.UseFittedPhiYields(true);
 
   // Some global constants you had
-  double luminosity_clas6 = 1248.495759;
+  double luminosity_clas6 = 1263.356542;
   double polarisation = 0.85;
   double branching = 0.49;
 
   // Apply your “final” DVEP selections and then pick exclusive phi event
   auto df_clas6_final = ApplyFinalDVEPSelections(df_clas6);
-  comparer.AddModelPhi(df_clas6_final, "Clas 6", beam_energy_fall2018);
+  comparer.AddModelPhi(df_clas6_final, "MC 10.6 GeV", beam_energy_fall2018);
 
   // -----------------------------
   // Shared summary plots
   std::cout << "Applying further cuts and plotting…" << std::endl;
   comparer.PlotPhiElectroProKinematicsComparison();
   comparer.PlotKinematicComparison_phiAna();
-  // comparer.PlotPhiAnaExclusivityComparisonByDetectorCases(detCuts);
-  comparer.PlotPhiInvMassPerBin_AllModels("PhiInvMassFits", 40, 0.988, 1.15,
-                                          true, luminosity_clas6, branching);
+  //comparer.PlotPhiAnaExclusivityComparisonByDetectorCases(detCuts);
+  comparer.PlotPhiInvMassPerBin_AllModels("PhiInvMassFits", 40, 0.988, 1.15, true, luminosity_clas6, branching);
   comparer.PlotPhiDSigmaDt_FromCache();
   gApplication->Terminate(0);
 }
@@ -324,17 +390,50 @@ void PlotEventGenPhi() // subset toggle inside missing-mass
 // -----------------------------------------------------------------------------
 // Final DVEP selections (kept, just fixed labels to match values)
 ROOT::RDF::RNode ApplyFinalDVEPSelections(ROOT::RDF::RNode df) {
-  return df
+  // NOTE: You may need to uncomment the lines below if your DISANAMath
+  // produces the kinematics columns (Q2, W, Mx2_eKpKm, etc.)
+  // If your ROOT files already contain these columns from a previous step,
+  // this is okay, but typically you need to define them via DISANAMath
+  // after getting the particle P, Theta, Phi.
+
+  // Since you had them in your original LUND parser, I'll keep them as Filters,
+  // assuming DISANAMath calls *will* be used later or were already defined.
+
+  // Define DISANAMath columns (if not already defined)
+  // The 'define_DISCAT' template is used to call DISANAMath methods
+  ROOT::RDF::RNode d = df;
+  float EbeamGeV = 10.600f; // Assuming 10.6 GeV
+
+  // Redefine DIS Kinematics
+  d = define_DISCAT(d, "Q2", &DISANAMath::GetQ2, EbeamGeV);
+  d = define_DISCAT(d, "W",  &DISANAMath::GetW,  EbeamGeV);
+  d = define_DISCAT(d, "xB", &DISANAMath::GetxB, EbeamGeV);
+  d = define_DISCAT(d, "t",  &DISANAMath::GetT,  EbeamGeV); // |t|
+  d = define_DISCAT(d, "phi", &DISANAMath::GetPhi, EbeamGeV); // 0..360
+
+  // Redefine Exclusivity Kinematics (needed for the commented-out filters below)
+  d = define_DISCAT(d, "Mx2_eKpKm", &DISANAMath::GetMx2_eKpKm, EbeamGeV);
+  d = define_DISCAT(d, "Mx2_epKp", &DISANAMath::GetMx2_epKp, EbeamGeV);
+  d = define_DISCAT(d, "Mx2_epKm", &DISANAMath::GetMx2_epKm, EbeamGeV);
+  d = define_DISCAT(d, "Cone_Kp", &DISANAMath::GetCone_Kp, EbeamGeV);
+  d = define_DISCAT(d, "Cone_Km", &DISANAMath::GetCone_Km, EbeamGeV);
+  d = define_DISCAT(d, "Cone_p", &DISANAMath::GetCone_p, EbeamGeV);
+  d = define_DISCAT(d, "Coplanarity_had_normals_deg", &DISANAMath::GetCoplanarity_had_normals_deg, EbeamGeV);
+  d = define_DISCAT(d, "PTmiss", &DISANAMath::GetPTmiss, EbeamGeV);
+  d = define_DISCAT(d, "Mx2_epKpKm", &DISANAMath::GetMx2_epKpKm, EbeamGeV);
+  d = define_DISCAT(d, "Emiss", &DISANAMath::GetEmiss, EbeamGeV);
+
+
+  return d
       // 4. Q2 > 1
       .Filter("Q2 > 1.0", "Cut: Q2 > 1 GeV^2")
       .Filter("W > 2.0", "Cut: W > 2.0 GeV")
-      .Filter("recel_p  > 1.5", "Cut: recel_p < 1.5 GeV")
-      //.Filter("bestEle_idx > 0", "Cut: reckPlus_p < 3.5 GeV")
-      .Filter("reckPlus_p  < 7.5", "Cut: reckPlus_p < 3.5 GeV")
-      .Filter("reckMinus_p < 7.5", "Cut: reckMinus_p < 3.5 GeV")
+      .Filter("recel_p  > 1.5", "Cut: recel_p > 1.5 GeV")
+      .Filter("reckPlus_p  < 7.5", "Cut: reckPlus_p < 7.5 GeV")
+      .Filter("reckMinus_p < 7.5", "Cut: reckMinus_p < 7.5 GeV");
 
-      // 9. Missing energy / exclusivity
-      .Filter("Mx2_eKpKm > 0.8*0.8 && Mx2_eKpKm < 1.08*1.08",
+      // Uncomment these lines if you want the exclusivity cuts applied:
+      /*.Filter("Mx2_eKpKm > 0.8*0.8 && Mx2_eKpKm < 1.08*1.08",
               "Cut: Proton Missing Mass Squared in [0.8,1.08] GeV^2")
       .Filter("Mx2_epKm > .08 && Mx2_epKm < 0.48",
               "Cut: Kaon Missing Mass Squared in [0.08,.48] GeV^2")
@@ -349,228 +448,111 @@ ROOT::RDF::RNode ApplyFinalDVEPSelections(ROOT::RDF::RNode df) {
       .Filter("Mx2_epKpKm < 0.0075",
               "Cut: Total Missing Mass squared < 0.0074 GeV")
       .Filter("Emiss <0.32 && Emiss> -0.175",
-              "Cut: Missing energy Emiss < 0.2 GeV");
+              "Cut: Missing energy Emiss < 0.2 GeV");*/
 }
 
-ROOT::RDF::RNode init(const std::string &lund_path) {
+/**
+ * Initializes RDataFrame from a ROOT file produced by ConvertOneLundToRootBare.
+ * It uses the vector columns (pid, px, py, pz) to define the single-particle
+ * columns (p_e, th_e, ph_e, etc.) needed by the rest of the analysis.
+ */
+ROOT::RDF::RNode init(const std::string &root_path) {
   // If we fail to read, return an empty RDataFrame node with 0 entries.
   auto returnEmptyNode = []() -> ROOT::RDF::RNode {
     static ROOT::RDataFrame emptyDF(0);
     return emptyDF;
   };
 
-  // Build an in-memory tree first
-  auto tree = std::make_unique<TTree>("lund", "LUND ep->epK+K-");
-
-  // ----------------------------
-  // Base per-particle branches
-  // ----------------------------
-  double p_e = -999, th_e = -999, ph_e = -999;
-  double p_p = -999, th_p = -999, ph_p = -999;
-  double p_kp = -999, th_kp = -999, ph_kp = -999;
-  double p_km = -999, th_km = -999, ph_km = -999;
-
-  double Q2 = 0, Tabs = 0, xB = 0, W = 0, Phi = 0, Wgt = 1.0;
-
-  tree->Branch("p_e", &p_e);
-  tree->Branch("th_e", &th_e);
-  tree->Branch("ph_e", &ph_e);
-  tree->Branch("p_p", &p_p);
-  tree->Branch("th_p", &th_p);
-  tree->Branch("ph_p", &ph_p);
-  tree->Branch("p_kp", &p_kp);
-  tree->Branch("th_kp", &th_kp);
-  tree->Branch("ph_kp", &ph_kp);
-  tree->Branch("p_km", &p_km);
-  tree->Branch("th_km", &th_km);
-  tree->Branch("ph_km", &ph_km);
-
-  tree->Branch("Q2", &Q2);
-  tree->Branch("t", &Tabs);      // |t| = -t
-  tree->Branch("xB", &xB);
-  tree->Branch("W", &W);
-  tree->Branch("phi", &Phi);     // 0..360
-  tree->Branch("w", &Wgt);
-
-  // ------------------------------------
-  // Exclusivity / geometry branches
-  // ------------------------------------
-  double mx2_ep = -999, emiss = -999, ptmiss = -999, mx2_epg = -999, mx2_epKpKm = -999;
-  double delta_phi = -999, theta_gg = -999, theta_gphi = -999;
-  double mx2_egamma = -999, mx2_eKpKm = -999, mx2_epKp = -999, mx2_epKm = -999;
-  double theta_e_gamma = -999, theta_e_phi = -999;
-  double cone_kp = -999, cone_km = -999, cone_p = -999;
-  double coplanarity_had_normals_deg = -999;
-  double DeltaE = -999, Mx_epKp = -999;
-
-  tree->Branch("Mx2_ep", &mx2_ep);
-  tree->Branch("Emiss", &emiss);
-  tree->Branch("PTmiss", &ptmiss);
-  tree->Branch("Mx2_epg", &mx2_epg); // fill only if available
-  tree->Branch("Mx2_epKpKm", &mx2_epKpKm);
-
-  tree->Branch("DeltaPhi", &delta_phi);
-  tree->Branch("Theta_gg", &theta_gg);
-  tree->Branch("Theta_g_phimeson", &theta_gphi);
-
-  tree->Branch("Mx2_egamma", &mx2_egamma);
-  tree->Branch("Mx2_eKpKm", &mx2_eKpKm);
-  tree->Branch("Mx2_epKp", &mx2_epKp);
-  tree->Branch("Mx2_epKm", &mx2_epKm);
-
-  tree->Branch("Theta_e_gamma", &theta_e_gamma);
-  tree->Branch("Theta_e_phimeson", &theta_e_phi);
-
-  tree->Branch("Cone_Kp", &cone_kp);
-  tree->Branch("Cone_Km", &cone_km);
-  tree->Branch("Cone_p", &cone_p);
-
-  tree->Branch("Coplanarity_had_normals_deg", &coplanarity_had_normals_deg);
-  tree->Branch("DeltaE", &DeltaE);
-  tree->Branch("Mx_epKp", &Mx_epKp);
-
-  // ---------- Parse LUND ----------
-  std::ifstream in(lund_path);
-  if (!in) {
-    std::cerr << "[init] ERROR: cannot open LUND file: " << lund_path << "\n";
+  // Open the ROOT file and store the pointer in the global "keep alive" struct.
+  // We use TFile::Open to handle network paths if needed.
+  g_hold.inFile = std::shared_ptr<TFile>(TFile::Open(root_path.c_str()));
+  if (!g_hold.inFile || g_hold.inFile->IsZombie()) {
+    std::cerr << "[init] ERROR: cannot open ROOT file: " << root_path << "\n";
+    g_hold.inFile.reset(); // clear the failed file pointer
     return returnEmptyNode();
   }
 
-  struct Part { int pdg=0; double px=0,py=0,pz=0,E=0,m=0; };
-  auto rad2deg = [](double r){ return r*180.0/3.14159265358979323846; };
-
-  std::size_t nEv = 0, nFilled = 0;
-  while (true) {
-    std::string header;
-    if (!std::getline(in, header)) break;
-    if (header.empty()) continue;
-
-    int Npart=0, A=0, Z=0, beamType=0, nucleonID=0, processID=0;
-    double Tpol=0, spinZ=0, Ebeam=0, weight=1.0;
-    {
-      std::istringstream hs(header);
-      hs >> Npart >> A >> Z >> Tpol >> spinZ >> beamType >> Ebeam >> nucleonID >> processID >> weight;
-      if (!hs) {
-        for (int i=0;i<Npart;i++) { std::string dummy; std::getline(in,dummy); }
-        continue;
-      }
-    }
-
-    Part pe{}, pp{}, pkp{}, pkm{};
-    bool gotE=false, gotP=false, gotKp=false, gotKm=false;
-
-    for (int i=0;i<Npart;i++) {
-      std::string pline; if (!std::getline(in, pline)) break;
-      if (pline.empty()) { --i; continue; }
-      std::istringstream ps(pline);
-      int idx=0, type=0, pdg=0, parent=0, fd=0; double lifetime=0;
-      double px=0, py=0, pz=0, E=0, m=0, vx=0, vy=0, vz=0;
-      ps >> idx >> lifetime >> type >> pdg >> parent >> fd >> px >> py >> pz >> E >> m >> vx >> vy >> vz;
-      if (!ps) continue;
-
-      if (pdg==11)       { pe  = Part{pdg,px,py,pz,E,m}; gotE=true; }
-      else if (pdg==2212){ pp  = Part{pdg,px,py,pz,E,m}; gotP=true; }
-      else if (pdg==321) { pkp = Part{pdg,px,py,pz,E,m}; gotKp=true; }
-      else if (pdg==-321){ pkm = Part{pdg,px,py,pz,E,m}; gotKm=true; }
-    }
-
-    ++nEv;
-    if (!(gotE && gotP)) continue;
-
-    auto to_ptp_rad = [](const Part& pr, double& p, double& th, double& ph){
-      p = std::sqrt(pr.px*pr.px + pr.py*pr.py + pr.pz*pr.pz);
-      double c = (p>0)? pr.pz/p : 1.0;
-      if (c> 1.0) c= 1.0; if (c<-1.0) c=-1.0;
-      th = std::acos(c);
-      ph = std::atan2(pr.py, pr.px);
-    };
-
-    double pe_p, pe_th, pe_ph; to_ptp_rad(pe,  pe_p, pe_th, pe_ph);
-    double pp_p, pp_th, pp_ph; to_ptp_rad(pp,  pp_p, pp_th, pp_ph);
-
-    double kp_p=0, kp_th=0, kp_ph=0, km_p=0, km_th=0, km_ph=0;
-    if (gotKp) to_ptp_rad(pkp, kp_p, kp_th, kp_ph);
-    if (gotKm) to_ptp_rad(pkm, km_p, km_th, km_ph);
-
-    // Build kinematics object (φ channel)
-    DISANAMath kin(Ebeam, pe_p, pe_th, pe_ph,
-                         pp_p, pp_th, pp_ph,
-                         km_p, km_th, km_ph,
-                         kp_p, kp_th, kp_ph);
-
-    auto set_deg = [&](double th_rad, double ph_rad, double& th_deg, double& ph_deg){
-      th_deg = rad2deg(th_rad);
-      double phd = rad2deg(ph_rad);
-      if (phd>180) phd -= 360;
-      if (phd<-180) phd += 360;
-      ph_deg = phd;
-    };
-
-    // Fill base per-particle cols (degrees)
-    p_e = pe_p; set_deg(pe_th, pe_ph, th_e, ph_e);
-    p_p = pp_p; set_deg(pp_th, pp_ph, th_p, ph_p);
-    if (gotKp){ p_kp=kp_p; set_deg(kp_th, kp_ph, th_kp, ph_kp); } else { p_kp=-999; th_kp=-999; ph_kp=-999; }
-    if (gotKm){ p_km=km_p; set_deg(km_th, km_ph, th_km, ph_km); } else { p_km=-999; th_km=-999; ph_km=-999; }
-
-    // DVEP
-    Q2   = kin.GetQ2();
-    xB   = kin.GetxB();
-    W    = kin.GetW();
-    Tabs = kin.GetT();      // |t|
-    Phi  = kin.GetPhi();    // 0..360
-    Wgt  = weight;
-
-    // Exclusivity / geometry
-    mx2_ep   = kin.GetMx2_ep();
-    emiss    = kin.GetEmiss();
-    ptmiss   = kin.GetPTmiss();
-    // mx2_epg = kin.GetMx2_epg(); // uncomment if available
-    mx2_egamma = kin.GetMx2_egamma();
-    theta_e_gamma = kin.GetTheta_e_gamma();
-    DeltaE   = kin.GetDeltaE();
-
-    mx2_epKpKm = kin.GetMx2_epKpKm();
-    delta_phi  = kin.GetDeltaPhi();
-    theta_gg   = kin.GetTheta_gamma_gamma();
-    theta_gphi = kin.GetTheta_g_phimeson();
-    mx2_eKpKm  = kin.GetMx2_eKpKm();
-    mx2_epKp   = kin.GetMx2_epKp();
-    mx2_epKm   = kin.GetMx2_epKm();
-    theta_e_phi= kin.GetTheta_e_phimeson();
-    cone_kp    = kin.GetCone_Kp();
-    cone_km    = kin.GetCone_Km();
-    cone_p     = kin.GetCone_p();
-    coplanarity_had_normals_deg = kin.GetCoplanarity_had_normals_deg();
-    Mx_epKp    = kin.GetMx_epKp();
-
-    tree->Fill();
-    ++nFilled;
-  }
-
-  std::cerr << "[init] Parsed events: " << nEv << ", filled: " << nFilled << "\n";
-
-  // ---------- Persist tree to file and build RDataFrame from file ----------
-  g_hold.outFilePath = "epKK_from_lund.root";          // choose your path
-  {
-    std::unique_ptr<TFile> fout(TFile::Open(g_hold.outFilePath.c_str(), "RECREATE"));
-    if (!fout || fout->IsZombie()) {
-      std::cerr << "[init] ERROR: cannot create ROOT file " << g_hold.outFilePath << "\n";
-      return returnEmptyNode();
-    }
-    fout->cd();
-    tree->Write();  // writes as "lund"
-    fout->Write();
-    // close here; we will reopen read-only below
-  }
-
-  // Keep the file open while the dataframe is used
-  g_hold.outFile.reset(TFile::Open(g_hold.outFilePath.c_str(), "READ"));
-  if (!g_hold.outFile || g_hold.outFile->IsZombie()) {
-    std::cerr << "[init] ERROR: cannot reopen ROOT file " << g_hold.outFilePath << " for reading\n";
+  // Get the TTree
+  TTree *tree = nullptr;
+  g_hold.inFile->GetObject("lund", tree);
+  if (!tree) {
+    std::cerr << "[init] ERROR: TTree 'lund' not found in file: " << root_path << "\n";
+    g_hold.inFile.reset();
     return returnEmptyNode();
   }
 
-  // Construct RDataFrame from the file-backed tree (works in all ROOT builds)
-  static ROOT::RDataFrame df_from_file("lund", g_hold.outFilePath.c_str());
-  return df_from_file;
+  // Create RDataFrame from the TTree
+  ROOT::RDataFrame df(*tree);
+  std::cout << "[init] Opened ROOT file and TTree 'lund' with " << df.Count().GetValue() << " entries.\n";
+
+  // --- Particle Data Group (PDG) codes ---
+  constexpr int PDG_E  = 11;    // Electron
+  constexpr int PDG_P  = 2212;  // Proton
+  constexpr int PDG_KP = 321;   // K+
+  constexpr int PDG_KM = -321;  // K-
+  
+  // Lambda function to call the helper for RDataFrame::Define
+  auto get_particle_kin = [](const std::vector<int>& pid,
+                             const std::vector<double>& px,
+                             const std::vector<double>& py,
+                             const std::vector<double>& pz,
+                             int targetPdg) -> std::array<double, 3> {
+      double p, th, ph;
+      get_ptp_deg_from_arrays(pid, px, py, pz, targetPdg, p, th, ph);
+      return {p, th, ph};
+  };
+
+  // Define a new column that holds {p, th_deg, ph_deg} for each particle
+  auto df_with_kin = df
+    // Electron
+    .Define("e_kin", [=](const std::vector<int>& pid, const std::vector<double>& px, 
+                         const std::vector<double>& py, const std::vector<double>& pz) {
+             return get_particle_kin(pid, px, py, pz, PDG_E);
+           }, {"pid", "px", "py", "pz"})
+    // Proton
+    .Define("p_kin", [=](const std::vector<int>& pid, const std::vector<double>& px, 
+                         const std::vector<double>& py, const std::vector<double>& pz) {
+             return get_particle_kin(pid, px, py, pz, PDG_P);
+           }, {"pid", "px", "py", "pz"})
+    // K+
+    .Define("kp_kin", [=](const std::vector<int>& pid, const std::vector<double>& px, 
+                          const std::vector<double>& py, const std::vector<double>& pz) {
+             return get_particle_kin(pid, px, py, pz, PDG_KP);
+           }, {"pid", "px", "py", "pz"})
+    // K-
+    .Define("km_kin", [=](const std::vector<int>& pid, const std::vector<double>& px, 
+                          const std::vector<double>& py, const std::vector<double>& pz) {
+             return get_particle_kin(pid, px, py, pz, PDG_KM);
+           }, {"pid", "px", "py", "pz"});
+  
+  // --- Split the {p, th_deg, ph_deg} array into the original column names ---
+  auto df_final_cols = df_with_kin
+    // Electron
+    .Define("p_e",  "e_kin[0]")
+    .Define("th_e", "e_kin[1]")
+    .Define("ph_e", "e_kin[2]")
+    // Proton
+    .Define("p_p",  "p_kin[0]")
+    .Define("th_p", "p_kin[1]")
+    .Define("ph_p", "p_kin[2]")
+    // K+
+    .Define("p_kp",  "kp_kin[0]")
+    .Define("th_kp", "kp_kin[1]")
+    .Define("ph_kp", "kp_kin[2]")
+    // K-
+    .Define("p_km",  "km_kin[0]")
+    .Define("th_km", "km_kin[1]")
+    .Define("ph_km", "km_kin[2]");
+
+  // The original ROOT file contains the event-level LUND header fields directly
+  // which can be renamed/kept as they are. The converter code uses the names:
+  // Q2, t, xB, W, phi, w. The ROOT file produced by the converter *doesn't*
+  // have these, but the LUND parser *did* calculate them via DISANAMath.
+  // Since we've replaced the LUND parser with a ROOT reader, these columns
+  // must be redefined later (which is done in ApplyFinalDVEPSelections).
+  // The columns present in the ROOT file are: Npart, A, Z, Tpol, SpinZ, Ebeam, etc.
+  // We keep the essential ones:
+  return df_final_cols
+    //.Define("Ebeam", "(double)Ebeam")
+    .Define("Wgt", "(double)Weight");
 }
